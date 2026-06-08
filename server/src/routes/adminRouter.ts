@@ -1,15 +1,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { Router } from 'express';
+import { fileURLToPath } from 'node:url';
 import { coverUpload, romUpload } from '../config/upload.js';
 import { ADMIN_COOKIE_NAME, requireAdmin } from '../middlewares/requireAdmin.js';
-import { createGame, listAllGames, serializeGame, serializeGames, updateGame } from '../services/gameRepository.js';
+import { createGame, deleteGame, listAllGames, pinGameToTop, serializeGame, serializeGames, updateGame } from '../services/gameRepository.js';
+import type { GameRecord } from '../services/gameRepository.js';
 
 type CreateGameBody = {
   title?: string;
   description?: string;
+  platform?: GameRecord['platform'];
   coverPath?: string;
   romPath?: string;
+  biosPath?: string;
   status?: 'draft' | 'published';
   sortOrder?: number;
 };
@@ -18,7 +22,9 @@ type CaptureCoverBody = {
   imageDataUrl?: string;
 };
 
-const coverUploadDir = path.resolve(process.cwd(), 'server/uploads/covers');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const coverUploadDir = path.resolve(__dirname, '../../uploads/covers');
 
 export const adminRouter = Router();
 
@@ -66,8 +72,10 @@ adminRouter.post('/games', requireAdmin, (req, res) => {
     const game = createGame({
       title: body.title,
       description: body.description ?? '',
+      platform: body.platform ?? 'nes',
       coverPath: body.coverPath ?? '',
       romPath: body.romPath,
+      biosPath: body.biosPath ?? '',
       status: body.status ?? 'draft',
       sortOrder: Number(body.sortOrder ?? 0),
     });
@@ -86,8 +94,10 @@ adminRouter.put('/games/:id', requireAdmin, (req, res) => {
     const game = updateGame(Number(req.params.id), {
       title: body.title,
       description: body.description,
+      platform: body.platform,
       coverPath: body.coverPath,
       romPath: body.romPath,
+      biosPath: body.biosPath,
       status: body.status,
       sortOrder: body.sortOrder === undefined ? undefined : Number(body.sortOrder),
     });
@@ -95,6 +105,26 @@ adminRouter.put('/games/:id', requireAdmin, (req, res) => {
     res.json({ success: true, data: serializeGame(game) });
   } catch (error) {
     const message = error instanceof Error ? error.message : '更新游戏失败';
+    res.status(400).json({ success: false, message });
+  }
+});
+
+adminRouter.post('/games/:id/pin', requireAdmin, (req, res) => {
+  try {
+    const game = pinGameToTop(Number(req.params.id));
+    res.json({ success: true, data: serializeGame(game) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '置顶游戏失败';
+    res.status(400).json({ success: false, message });
+  }
+});
+
+adminRouter.delete('/games/:id', requireAdmin, (req, res) => {
+  try {
+    const game = deleteGame(Number(req.params.id));
+    res.json({ success: true, data: serializeGame(game) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '删除游戏失败';
     res.status(400).json({ success: false, message });
   }
 });

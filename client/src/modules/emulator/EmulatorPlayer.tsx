@@ -13,6 +13,8 @@ type SaveSlot = {
   screenshotDataUrl: string | null;
 };
 
+type TurboKey = 'p1a' | 'p1b' | 'p2a' | 'p2b';
+
 export type EmulatorJsInstance = {
   on?: (event: string, callback: () => void) => void;
   gameManager: {
@@ -23,6 +25,13 @@ export type EmulatorJsInstance = {
     simulateInput: (player: number, index: number, value: number) => void;
   };
   displayMessage?: (message: string, duration?: number) => void;
+};
+
+type ClosableEmulatorJsInstance = EmulatorJsInstance & {
+  exit?: () => void;
+  destroy?: () => void;
+  stop?: () => void;
+  pause?: () => void;
 };
 
 type EmulatorJsRuntimeInstance = EmulatorJsInstance & {
@@ -36,6 +45,53 @@ const NES_BUTTON_B = 0;
 const NES_BUTTON_A = 8;
 const TURBO_INTERVAL_MS = 50;
 const RESERVED_HOTKEY_BUTTONS = [24, 25, 26, 27, 28, 29] as const;
+const PLAYER_ONE = 0;
+const PLAYER_TWO = 1;
+
+function getEmulatorSystem(game: Game) {
+  const systemByPlatform: Record<Game['platform'], string> = {
+    arcade: 'arcade',
+    gb: 'gb',
+    gba: 'gba',
+    gbc: 'gb',
+    nes: 'nes',
+    pce: 'pce',
+    segaMD: 'segaMD',
+    snes: 'snes',
+  };
+
+  return systemByPlatform[game.platform];
+}
+
+function getRetroArchCore(game: Game) {
+  const coreByPlatform: Record<Game['platform'], string> = {
+    arcade: 'fbneo',
+    gb: 'gambatte',
+    gba: 'mgba',
+    gbc: 'gambatte',
+    nes: 'nestopia',
+    pce: 'mednafen_pce',
+    segaMD: 'genesis_plus_gx',
+    snes: 'snes9x',
+  };
+
+  return coreByPlatform[game.platform];
+}
+
+function getPlatformLabel(platform: Game['platform']) {
+  const labels: Record<Game['platform'], string> = {
+    arcade: '街机 / FBNeo',
+    gb: 'GB',
+    gba: 'GBA',
+    gbc: 'GBC',
+    nes: 'FC / NES',
+    pce: 'PCE',
+    segaMD: 'MD / Genesis',
+    snes: 'SFC / SNES',
+  };
+
+  return labels[platform];
+}
 
 export type EmulatorJsWindow = Window & typeof globalThis & {
   EmulatorJS?: new (element: string, config: Record<string, unknown>) => EmulatorJsInstance;
@@ -99,13 +155,14 @@ export function pngBytesToDataUrl(bytes: Uint8Array) {
 export function createEmulatorConfig(game: Game, playerSelector: string) {
   return {
     gameUrl: game.romUrl,
+    biosUrl: game.biosUrl || undefined,
     dataPath: '/emulatorjs/data/',
-    system: 'nes',
+    system: getEmulatorSystem(game),
     gameName: `game-${game.id}`,
     startOnLoad: true,
     noAutoFocus: false,
     defaultOptions: {
-      retroarch_core: 'nestopia',
+      retroarch_core: getRetroArchCore(game),
     },
     defaultControllers: {
       0: {
@@ -117,8 +174,23 @@ export function createEmulatorConfig(game: Game, playerSelector: string) {
         6: { value: 65 },
         7: { value: 68 },
         8: { value: 74 },
+        9: { value: 76 },
+        10: { value: 79 },
+        11: { value: 80 },
       },
-      1: {},
+      1: {
+        0: { value: 98 },
+        2: { value: 96 },
+        3: { value: 13 },
+        4: { value: 38 },
+        5: { value: 40 },
+        6: { value: 37 },
+        7: { value: 39 },
+        8: { value: 97 },
+        9: { value: 99 },
+        10: { value: 102 },
+        11: { value: 103 },
+      },
       2: {},
       3: {},
     },
@@ -242,9 +314,9 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
   const playerShellRef = useRef<HTMLElement | null>(null);
   const emulatorHostRef = useRef<HTMLDivElement | null>(null);
   const instanceRef = useRef<EmulatorJsInstance | null>(null);
-  const turboIntervalsRef = useRef<{ a: number | null; b: number | null }>({ a: null, b: null });
+  const turboIntervalsRef = useRef<Record<TurboKey, number | null>>({ p1a: null, p1b: null, p2a: null, p2b: null });
   const [status, setStatus] = useState('正在加载模拟器...');
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(() => Boolean(document.fullscreenElement));
   const [saveSlots, setSaveSlots] = useState<SaveSlot[]>([]);
   const [slotDialogMode, setSlotDialogMode] = useState<'save' | 'load' | null>(null);
   const [recentSlot, setRecentSlot] = useState<number | null>(null);
@@ -253,11 +325,43 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
     emulatorHostRef.current?.focus();
   }
 
-  function stopTurbo(button: 'a' | 'b') {
-    const turboInterval = turboIntervalsRef.current[button];
+  function closeEmulator() {
+    const emulatorWindow = window as EmulatorJsWindow;
+    const emulator = instanceRef.current as ClosableEmulatorJsInstance | null;
+
+    stopAllTurbo();
+
+    try {
+      emulator?.pause?.();
+      emulator?.stop?.();
+      emulator?.exit?.();
+      emulator?.destroy?.();
+    } catch {
+      // Ignore cleanup errors while leaving the play page.
+    }
+
+    if (emulatorHostRef.current) {
+      emulatorHostRef.current.innerHTML = '';
+    }
+
+    instanceRef.current = null;
+    delete emulatorWindow.EJS_onGameStart;
+    delete emulatorWindow.EJS_onError;
+    delete emulatorWindow.EJS_emulator;
+  }
+
+  function getTurboTarget(turboKey: TurboKey) {
+    return {
+      player: turboKey.startsWith('p1') ? PLAYER_ONE : PLAYER_TWO,
+      buttonIndex: turboKey.endsWith('a') ? NES_BUTTON_A : NES_BUTTON_B,
+    };
+  }
+
+  function stopTurbo(turboKey: TurboKey) {
+    const turboInterval = turboIntervalsRef.current[turboKey];
     if (turboInterval !== null) {
       window.clearInterval(turboInterval);
-      turboIntervalsRef.current[button] = null;
+      turboIntervalsRef.current[turboKey] = null;
     }
 
     const emulator = instanceRef.current;
@@ -265,26 +369,34 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
       return;
     }
 
-    emulator.gameManager.simulateInput(0, button === 'a' ? NES_BUTTON_A : NES_BUTTON_B, 0);
+    const target = getTurboTarget(turboKey);
+    emulator.gameManager.simulateInput(target.player, target.buttonIndex, 0);
   }
 
-  function startTurbo(button: 'a' | 'b') {
+  function stopAllTurbo() {
+    stopTurbo('p1a');
+    stopTurbo('p1b');
+    stopTurbo('p2a');
+    stopTurbo('p2b');
+  }
+
+  function startTurbo(turboKey: TurboKey) {
     const emulator = instanceRef.current;
-    if (!emulator || turboIntervalsRef.current[button] !== null) {
+    if (!emulator || turboIntervalsRef.current[turboKey] !== null) {
       return;
     }
 
-    const buttonIndex = button === 'a' ? NES_BUTTON_A : NES_BUTTON_B;
+    const target = getTurboTarget(turboKey);
     let pressed = false;
-    turboIntervalsRef.current[button] = window.setInterval(() => {
+    turboIntervalsRef.current[turboKey] = window.setInterval(() => {
       const activeEmulator = instanceRef.current;
       if (!activeEmulator) {
-        stopTurbo(button);
+        stopTurbo(turboKey);
         return;
       }
 
       pressed = !pressed;
-      activeEmulator.gameManager.simulateInput(0, buttonIndex, pressed ? 1 : 0);
+      activeEmulator.gameManager.simulateInput(target.player, target.buttonIndex, pressed ? 1 : 0);
     }, TURBO_INTERVAL_MS);
   }
 
@@ -352,9 +464,10 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
 
   useEffect(() => {
     const handleFullscreenChange = () => {
-      setIsFullscreen(document.fullscreenElement === playerShellRef.current);
+      setIsFullscreen(Boolean(document.fullscreenElement));
     };
 
+    handleFullscreenChange();
     document.addEventListener('fullscreenchange', handleFullscreenChange);
 
     return () => {
@@ -460,13 +573,25 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.code === 'KeyU') {
         event.preventDefault();
-        startTurbo('a');
+        startTurbo('p1a');
         return;
       }
 
       if (event.code === 'KeyI') {
         event.preventDefault();
-        startTurbo('b');
+        startTurbo('p1b');
+        return;
+      }
+
+      if (event.code === 'Numpad4') {
+        event.preventDefault();
+        startTurbo('p2a');
+        return;
+      }
+
+      if (event.code === 'Numpad5') {
+        event.preventDefault();
+        startTurbo('p2b');
         return;
       }
 
@@ -503,19 +628,30 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
     const handleKeyUp = (event: KeyboardEvent) => {
       if (event.code === 'KeyU') {
         event.preventDefault();
-        stopTurbo('a');
+        stopTurbo('p1a');
         return;
       }
 
       if (event.code === 'KeyI') {
         event.preventDefault();
-        stopTurbo('b');
+        stopTurbo('p1b');
+        return;
+      }
+
+      if (event.code === 'Numpad4') {
+        event.preventDefault();
+        stopTurbo('p2a');
+        return;
+      }
+
+      if (event.code === 'Numpad5') {
+        event.preventDefault();
+        stopTurbo('p2b');
       }
     };
 
     const handleWindowBlur = () => {
-      stopTurbo('a');
-      stopTurbo('b');
+      stopAllTurbo();
     };
 
     const handlePointerDown = () => {
@@ -529,21 +665,25 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
 
     return () => {
       disposed = true;
-      stopTurbo('a');
-      stopTurbo('b');
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleWindowBlur);
       emulatorHost.removeEventListener('pointerdown', handlePointerDown);
-      if (emulatorHostRef.current) {
-        emulatorHostRef.current.innerHTML = '';
-      }
-      instanceRef.current = null;
-      delete emulatorWindow.EJS_onGameStart;
-      delete emulatorWindow.EJS_onError;
-      delete emulatorWindow.EJS_emulator;
+      closeEmulator();
     };
-  }, [game.id, game.title, game.romUrl]);
+  }, [game.biosUrl, game.id, game.platform, game.title, game.romUrl]);
+
+  async function handleReturnHome() {
+    closeEmulator();
+
+    if (document.fullscreenElement) {
+      try {
+        await document.exitFullscreen();
+      } catch {
+        // Continue navigation even if fullscreen exit is denied.
+      }
+    }
+  }
 
   async function handleSave(slot = 1) {
     const emulator = instanceRef.current;
@@ -605,7 +745,7 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
     }
 
     try {
-      if (document.fullscreenElement === playerShell) {
+      if (document.fullscreenElement) {
         await document.exitFullscreen();
         setStatus('已退出全屏');
         return;
@@ -622,7 +762,7 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
     <>
       {!isFullscreen ? (
         <div className="page-top-actions align-left">
-          <Link to="/" className="text-link">
+          <Link to="/" className="text-link" onClick={() => void handleReturnHome()}>
             返回首页
           </Link>
         </div>
@@ -637,15 +777,45 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
           <p className="eyebrow">游玩页</p>
           <h1>{game.title}</h1>
           <p className="muted">{game.description || '当前游戏暂无简介。'}</p>
-          <ul className="keymap">
-            <li>WASD: 移动</li>
-            <li>J: A</li>
-            <li>K: B</li>
-            <li>U: Turbo A</li>
-            <li>I: Turbo B</li>
-            <li>Enter: Start</li>
-            <li>Shift: Select</li>
-          </ul>
+          <p className="muted">平台: {getPlatformLabel(game.platform)}</p>
+          {game.platform === 'arcade' ? (
+            <ul className="keymap">
+              <li>1P WASD: 移动</li>
+              <li>1P J/K/L/O/P: 按键 A/B/C/D/E</li>
+              <li>1P U/I: Turbo A/B</li>
+              <li>2P 方向键: 移动</li>
+              <li>2P 小键盘 1/2/3/6/7: 按键 A/B/C/D/E</li>
+              <li>2P 小键盘 4/5: Turbo A/B</li>
+              <li>2P 小键盘 Enter: Start</li>
+              <li>2P 小键盘 0: Select/Coin</li>
+              <li>Enter: 1P Start</li>
+              <li>Shift: 1P Select/Coin</li>
+            </ul>
+          ) : game.platform === 'snes' || game.platform === 'segaMD' ? (
+            <ul className="keymap">
+              <li>1P WASD: 移动</li>
+              <li>1P J/K/L/O/P: 主按键</li>
+              <li>1P Enter: Start</li>
+              <li>1P Shift: Select/Mode</li>
+              <li>2P 方向键: 移动</li>
+              <li>2P 小键盘 1/2/3/6/7: 主按键</li>
+              <li>2P 小键盘 Enter: Start</li>
+              <li>2P 小键盘 0: Select/Mode</li>
+            </ul>
+          ) : (
+            <ul className="keymap">
+              <li>1P WASD: 移动</li>
+              <li>1P J/K: A/B</li>
+              <li>1P U/I: Turbo A/B</li>
+              <li>2P 方向键: 移动</li>
+              <li>2P 小键盘 1/2: A/B</li>
+              <li>2P 小键盘 4/5: Turbo A/B</li>
+              <li>2P 小键盘 Enter: Start</li>
+              <li>2P 小键盘 0: Select</li>
+              <li>Enter: Start</li>
+              <li>Shift: Select</li>
+            </ul>
+          )}
           <div className={`card-actions player-actions ${isFullscreen ? 'is-fullscreen' : ''}`}>
             <button type="button" onClick={() => setSlotDialogMode('save')}>
               保存进度 F1

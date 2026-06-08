@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
+import { StartGameLink } from '../components/StartGameLink';
 import { fetchGameDetail } from '../services/api';
 import type { Game } from '../types/game';
 
@@ -35,12 +36,18 @@ export function GameDetailPage() {
 
       <section className="panel">
         <p className="eyebrow">游戏详情</p>
-        <h1>{game?.title ?? `游戏 ${id ?? ''}`}</h1>
-        <p className="muted">{status || game?.description || '当前游戏暂无简介。'}</p>
-        {game?.coverUrl ? <img className="game-cover" src={game.coverUrl} alt={game.title} /> : null}
-        <div className="card-actions">
-          {game ? <Link to={`/play/${game.id}`}>开始游戏</Link> : null}
+        <div className="detail-header-row">
+          <h1>{game?.title ?? `游戏 ${id ?? ''}`}</h1>
+          {game ? (
+            <StartGameLink gameId={game.id} className="detail-play-button">
+              开始游戏
+            </StartGameLink>
+          ) : null}
         </div>
+        <div className="detail-description-card">
+          <p className="muted detail-description-text">{status || game?.description || '当前游戏暂无简介。'}</p>
+        </div>
+        {game?.coverUrl ? <img className="game-cover" src={game.coverUrl} alt={game.title} /> : null}
       </section>
     </main>
   );
