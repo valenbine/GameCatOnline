@@ -3,8 +3,12 @@ export type Game = {
   title: string;
   slug: string;
   description: string;
-  platform: 'nes' | 'arcade' | 'snes' | 'gba' | 'gb' | 'gbc' | 'segaMD' | 'pce';
+  controlsHelp: string;
+  platform: 'nes' | 'arcade' | 'mame' | 'cps1' | 'cps2' | 'snes' | 'gba' | 'gb' | 'gbc' | 'segaMD' | 'pce';
   coverUrl: string;
+  coverCaptureScore: number;
+  coverCaptureStatus: 'unknown' | 'auto-ok' | 'needs-review' | 'failed' | 'manual';
+  coverCaptureError: string;
   romUrl: string;
   biosUrl: string;
   status: 'draft' | 'published';

@@ -2,6 +2,7 @@ import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import './db/database.js';
@@ -13,11 +14,16 @@ const __dirname = path.dirname(__filename);
 const workspaceRoot = path.resolve(__dirname, '../..');
 const clientDistDir = path.join(workspaceRoot, 'client', 'dist');
 const emulatorDataDir = path.join(workspaceRoot, 'node_modules', '@emulatorjs', 'emulatorjs', 'data');
+const uploadsDir = path.resolve(__dirname, '../uploads');
+const romUploadDir = path.join(uploadsDir, 'roms');
 const emulatorCorePackageRoot = path.join('/usr/local/lib/node_modules', '@emulatorjs');
 const emulatorCorePackageNames = [
+  'core-fbalpha2012_cps1',
+  'core-fbalpha2012_cps2',
   'core-fbneo',
   'core-gambatte',
   'core-genesis_plus_gx',
+  'core-mame2003_plus',
   'core-mednafen_pce',
   'core-mgba',
   'core-nestopia',
@@ -34,7 +40,29 @@ app.use(
 );
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
-app.use('/uploads', express.static(path.resolve(__dirname, '../uploads')));
+app.get('/uploads/roms/:fileName', (req, res, next) => {
+  const fileName = path.basename(req.params.fileName).replace(/[^a-zA-Z0-9-_.]/g, '-');
+  const directPath = path.join(romUploadDir, fileName);
+
+  if (fs.existsSync(directPath)) {
+    res.sendFile(directPath);
+    return;
+  }
+
+  const matchingFiles = fs
+    .readdirSync(romUploadDir)
+    .filter((candidate) => candidate.endsWith(`-${fileName}`))
+    .sort();
+  const matchingFile = matchingFiles[matchingFiles.length - 1];
+
+  if (!matchingFile) {
+    next();
+    return;
+  }
+
+  res.sendFile(path.join(romUploadDir, matchingFile));
+});
+app.use('/uploads', express.static(uploadsDir));
 app.use('/emulatorjs/data', express.static(emulatorDataDir));
 for (const corePackageName of emulatorCorePackageNames) {
   app.use('/emulatorjs/data/cores', express.static(path.join(emulatorCorePackageRoot, corePackageName)));

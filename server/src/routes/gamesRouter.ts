@@ -3,8 +3,34 @@ import { findPublishedGameById, listPublishedGames, serializeGame, serializeGame
 
 export const gamesRouter = Router();
 
-gamesRouter.get('/', (_req, res) => {
-  res.json({ success: true, data: serializeGames(listPublishedGames()) });
+const pageSizes = new Set([10, 20, 50, 100]);
+type PublicSortMode = 'updated-desc' | 'sort-desc' | 'title-asc';
+
+function getPaginationQuery(query: Record<string, unknown>) {
+  const page = Number(query.page ?? 1);
+  const requestedPageSize = Number(query.pageSize ?? 10);
+  const sort: PublicSortMode = query.sort === 'sort-desc' || query.sort === 'title-asc' ? query.sort : 'updated-desc';
+  return {
+    page: Number.isInteger(page) && page > 0 ? page : 1,
+    pageSize: pageSizes.has(requestedPageSize) ? requestedPageSize : 10,
+    search: typeof query.search === 'string' ? query.search : '',
+    featuredOnly: query.featured === '1',
+    sort,
+  };
+}
+
+gamesRouter.get('/', (req, res) => {
+  const result = listPublishedGames(getPaginationQuery(req.query));
+  res.json({
+    success: true,
+    data: {
+      items: serializeGames(result.items),
+      total: result.total,
+      page: result.page,
+      pageSize: result.pageSize,
+      totalPages: result.totalPages,
+    },
+  });
 });
 
 gamesRouter.get('/:id', (req, res) => {

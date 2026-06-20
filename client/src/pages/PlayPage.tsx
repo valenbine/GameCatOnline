@@ -58,7 +58,18 @@ export function PlayPage() {
 
   return (
     <main className="page">
-      {game ? <EmulatorPlayer game={game} /> : <section className="panel"><p className="muted">{status}</p><Link to="/">返回首页</Link></section>}
+      {game ? (
+        <EmulatorPlayer game={game} />
+      ) : (
+        <section className="panel play-loading-panel">
+          <p className="eyebrow">正在装载馆藏</p>
+          <h1>请稍等，游戏正在接入展厅画面</h1>
+          <p className="muted">{status}</p>
+          <Link to="/" className="text-link play-loading-link">
+            返回首页
+          </Link>
+        </section>
+      )}
     </main>
   );
 }

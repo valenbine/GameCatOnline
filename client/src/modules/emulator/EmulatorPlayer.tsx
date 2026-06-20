@@ -1,7 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { deleteGameState, listGameStates, loadGameState, saveGameState } from '../../services/saveStorage';
 import type { Game } from '../../types/game';
+import { clearKeyBindings, createKeymapGroups, findComboKey, findManualInputKey, findTurboKey, getDefaultKeyBindings, loadKeyBindings, saveKeyBindings, type PlayerKeyBindings } from './keyBindings';
+import { base64ToBytes, bytesToBase64, pngBytesToDataUrl } from './emulatorImage';
+import { consumeKeyboardEvent, getPlatformLabel, stripManualInputKeyCodes, stripNativeKeyboardControls, stripNativeStartControls, stripReservedHotkeys } from './emulatorInputRuntime';
+import { attachLifecycleLogs, createEmulatorConfig, forceCloseActiveEmulator, getCoreOptionSettings, getEmulatorSystem, getRetroArchCore, loadEmulatorAssets, type EmulatorJsInstance, type EmulatorJsRuntimeInstance, type EmulatorJsWindow } from './emulatorRuntime';
 
 type EmulatorPlayerProps = {
   game: Game;
@@ -15,310 +19,42 @@ type SaveSlot = {
 
 type TurboKey = 'p1a' | 'p1b' | 'p2a' | 'p2b';
 
-export type EmulatorJsInstance = {
-  on?: (event: string, callback: () => void) => void;
-  gameManager: {
-    getState: () => Uint8Array;
-    loadState: (state: Uint8Array) => void;
-    restart: () => void;
-    screenshot: () => Promise<Uint8Array>;
-    simulateInput: (player: number, index: number, value: number) => void;
-  };
-  displayMessage?: (message: string, duration?: number) => void;
-};
-
-type ClosableEmulatorJsInstance = EmulatorJsInstance & {
-  exit?: () => void;
-  destroy?: () => void;
-  stop?: () => void;
-  pause?: () => void;
-};
-
-type EmulatorJsRuntimeInstance = EmulatorJsInstance & {
-  controls?: Record<number, Record<number, { value?: number; value2?: string }>>;
-  defaultControllers?: Record<number, Record<number, { value?: number; value2?: string }>>;
-  saveSettings?: () => void;
-  getLocalStorageKey?: () => string;
-};
-
 const NES_BUTTON_B = 0;
 const NES_BUTTON_A = 8;
+const START_BUTTON_INDEX = 3;
 const TURBO_INTERVAL_MS = 50;
-const RESERVED_HOTKEY_BUTTONS = [24, 25, 26, 27, 28, 29] as const;
 const PLAYER_ONE = 0;
 const PLAYER_TWO = 1;
 
-function getEmulatorSystem(game: Game) {
-  const systemByPlatform: Record<Game['platform'], string> = {
-    arcade: 'arcade',
-    gb: 'gb',
-    gba: 'gba',
-    gbc: 'gb',
-    nes: 'nes',
-    pce: 'pce',
-    segaMD: 'segaMD',
-    snes: 'snes',
-  };
+function getLoadingStatus(platform: Game['platform']) {
+  if (platform === 'arcade' || platform === 'mame' || platform === 'cps1' || platform === 'cps2') {
+    return '正在解压街机 ROM 并启动模拟器，首次启动可能需要几秒...';
+  }
 
-  return systemByPlatform[game.platform];
+  return '正在加载模拟器...';
 }
-
-function getRetroArchCore(game: Game) {
-  const coreByPlatform: Record<Game['platform'], string> = {
-    arcade: 'fbneo',
-    gb: 'gambatte',
-    gba: 'mgba',
-    gbc: 'gambatte',
-    nes: 'nestopia',
-    pce: 'mednafen_pce',
-    segaMD: 'genesis_plus_gx',
-    snes: 'snes9x',
-  };
-
-  return coreByPlatform[game.platform];
-}
-
-function getPlatformLabel(platform: Game['platform']) {
-  const labels: Record<Game['platform'], string> = {
-    arcade: '街机 / FBNeo',
-    gb: 'GB',
-    gba: 'GBA',
-    gbc: 'GBC',
-    nes: 'FC / NES',
-    pce: 'PCE',
-    segaMD: 'MD / Genesis',
-    snes: 'SFC / SNES',
-  };
-
-  return labels[platform];
-}
-
-export type EmulatorJsWindow = Window & typeof globalThis & {
-  EmulatorJS?: new (element: string, config: Record<string, unknown>) => EmulatorJsInstance;
-  EJS_player?: string;
-  EJS_core?: string;
-  EJS_gameUrl?: string;
-  EJS_gameName?: string;
-  EJS_pathtodata?: string;
-  EJS_startOnLoaded?: boolean;
-  EJS_askBeforeExit?: boolean;
-  EJS_noAutoFocus?: boolean;
-  EJS_defaultOptions?: Record<string, string>;
-  EJS_defaultControls?: Record<number, Record<string, { value: string }>>;
-  EJS_emulator?: EmulatorJsInstance;
-  EJS_onGameStart?: () => void;
-  EJS_onLoadState?: () => void;
-  EJS_onError?: (message: string) => void;
-};
-
-const emulatorAssetPrefix = '/emulatorjs/data';
-const emulatorStyleId = 'emulatorjs-style';
-const emulatorScriptIds = {
-  emulator: 'emulatorjs-script-emulator',
-  nipplejs: 'emulatorjs-script-nipplejs',
-  shaders: 'emulatorjs-script-shaders',
-  storage: 'emulatorjs-script-storage',
-  gamepad: 'emulatorjs-script-gamepad',
-  gameManager: 'emulatorjs-script-gamemanager',
-  socketIo: 'emulatorjs-script-socketio',
-  compression: 'emulatorjs-script-compression',
-} as const;
 
 function getRecentSlotStorageKey(gameId: number) {
   return `game-cat-online:recent-slot:${gameId}`;
-}
-
-function bytesToBase64(bytes: Uint8Array) {
-  let binary = '';
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-
-  return window.btoa(binary);
-}
-
-function base64ToBytes(base64: string) {
-  const binary = window.atob(base64);
-  const bytes = new Uint8Array(binary.length);
-
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-
-  return bytes;
-}
-
-export function pngBytesToDataUrl(bytes: Uint8Array) {
-  return `data:image/png;base64,${bytesToBase64(bytes)}`;
-}
-
-export function createEmulatorConfig(game: Game, playerSelector: string) {
-  return {
-    gameUrl: game.romUrl,
-    biosUrl: game.biosUrl || undefined,
-    dataPath: '/emulatorjs/data/',
-    system: getEmulatorSystem(game),
-    gameName: `game-${game.id}`,
-    startOnLoad: true,
-    noAutoFocus: false,
-    defaultOptions: {
-      retroarch_core: getRetroArchCore(game),
-    },
-    defaultControllers: {
-      0: {
-        0: { value: 75 },
-        2: { value: 16 },
-        3: { value: 13 },
-        4: { value: 87 },
-        5: { value: 83 },
-        6: { value: 65 },
-        7: { value: 68 },
-        8: { value: 74 },
-        9: { value: 76 },
-        10: { value: 79 },
-        11: { value: 80 },
-      },
-      1: {
-        0: { value: 98 },
-        2: { value: 96 },
-        3: { value: 13 },
-        4: { value: 38 },
-        5: { value: 40 },
-        6: { value: 37 },
-        7: { value: 39 },
-        8: { value: 97 },
-        9: { value: 99 },
-        10: { value: 102 },
-        11: { value: 103 },
-      },
-      2: {},
-      3: {},
-    },
-    alignStartButton: 'bottom',
-    gameId: playerSelector,
-  };
-}
-
-export function stripReservedHotkeys(instance: EmulatorJsInstance) {
-  const runtimeInstance = instance as EmulatorJsRuntimeInstance;
-
-  for (const buttonIndex of RESERVED_HOTKEY_BUTTONS) {
-    if (runtimeInstance.controls?.[0]?.[buttonIndex]) {
-      delete runtimeInstance.controls[0][buttonIndex];
-    }
-
-    if (runtimeInstance.defaultControllers?.[0]?.[buttonIndex]) {
-      delete runtimeInstance.defaultControllers[0][buttonIndex];
-    }
-  }
-
-  const localStorageKey = runtimeInstance.getLocalStorageKey?.();
-  if (localStorageKey) {
-    const rawValue = window.localStorage.getItem(localStorageKey);
-    if (rawValue) {
-      try {
-        const coreSpecific = JSON.parse(rawValue) as {
-          controlSettings?: Record<number, Record<number, { value?: number; value2?: string }>>;
-        };
-        for (const buttonIndex of RESERVED_HOTKEY_BUTTONS) {
-          if (coreSpecific.controlSettings?.[0]?.[buttonIndex]) {
-            delete coreSpecific.controlSettings[0][buttonIndex];
-          }
-        }
-        window.localStorage.setItem(localStorageKey, JSON.stringify(coreSpecific));
-      } catch {
-        window.localStorage.removeItem(localStorageKey);
-      }
-    }
-  }
-
-  runtimeInstance.saveSettings?.();
-}
-
-function attachLifecycleLogs(instance: EmulatorJsInstance, game: Game) {
-  instance.on?.('ready', () => {
-    console.log('[EmulatorPlayer] ready', { gameId: game.id, title: game.title });
-  });
-  instance.on?.('start', () => {
-    console.log('[EmulatorPlayer] start', { gameId: game.id, title: game.title });
-  });
-}
-
-function loadStyleOnce(id: string, href: string) {
-  return new Promise<void>((resolve, reject) => {
-    const existingLink = document.getElementById(id) as HTMLLinkElement | null;
-    if (existingLink) {
-      if (existingLink.dataset.loaded === 'true') {
-        resolve();
-        return;
-      }
-
-      existingLink.addEventListener('load', () => resolve(), { once: true });
-      existingLink.addEventListener('error', () => reject(new Error(`资源加载失败: ${href}`)), { once: true });
-      return;
-    }
-
-    const link = document.createElement('link');
-    link.id = id;
-    link.rel = 'stylesheet';
-    link.href = href;
-    link.onload = () => {
-      link.dataset.loaded = 'true';
-      resolve();
-    };
-    link.onerror = () => reject(new Error(`资源加载失败: ${href}`));
-    document.head.appendChild(link);
-  });
-}
-
-function loadScriptOnce(id: string, src: string) {
-  return new Promise<void>((resolve, reject) => {
-    const existingScript = document.getElementById(id) as HTMLScriptElement | null;
-    if (existingScript) {
-      if (existingScript.dataset.loaded === 'true') {
-        resolve();
-        return;
-      }
-
-      existingScript.addEventListener('load', () => resolve(), { once: true });
-      existingScript.addEventListener('error', () => reject(new Error(`资源加载失败: ${src}`)), { once: true });
-      return;
-    }
-
-    const script = document.createElement('script');
-    script.id = id;
-    script.src = src;
-    script.async = false;
-    script.onload = () => {
-      script.dataset.loaded = 'true';
-      resolve();
-    };
-    script.onerror = () => reject(new Error(`资源加载失败: ${src}`));
-    document.body.appendChild(script);
-  });
-}
-
-export async function loadEmulatorAssets() {
-  await loadStyleOnce(emulatorStyleId, `${emulatorAssetPrefix}/emulator.css`);
-  await loadScriptOnce(emulatorScriptIds.emulator, `${emulatorAssetPrefix}/src/emulator.js`);
-  await loadScriptOnce(emulatorScriptIds.nipplejs, `${emulatorAssetPrefix}/src/nipplejs.js`);
-  await loadScriptOnce(emulatorScriptIds.shaders, `${emulatorAssetPrefix}/src/shaders.js`);
-  await loadScriptOnce(emulatorScriptIds.storage, `${emulatorAssetPrefix}/src/storage.js`);
-  await loadScriptOnce(emulatorScriptIds.gamepad, `${emulatorAssetPrefix}/src/gamepad.js`);
-  await loadScriptOnce(emulatorScriptIds.gameManager, `${emulatorAssetPrefix}/src/GameManager.js`);
-  await loadScriptOnce(emulatorScriptIds.socketIo, `${emulatorAssetPrefix}/src/socket.io.min.js`);
-  await loadScriptOnce(emulatorScriptIds.compression, `${emulatorAssetPrefix}/src/compression.js`);
 }
 
 export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
   const playerShellRef = useRef<HTMLElement | null>(null);
   const emulatorHostRef = useRef<HTMLDivElement | null>(null);
   const instanceRef = useRef<EmulatorJsInstance | null>(null);
+  const emulatorParentKeyCaptureCleanupRef = useRef<(() => void) | null>(null);
+  const keyBindingDialogOpenRef = useRef(false);
+  const keyBindingsRef = useRef<PlayerKeyBindings>(loadKeyBindings(game));
+  const activeComboKeysRef = useRef<Set<string>>(new Set());
   const turboIntervalsRef = useRef<Record<TurboKey, number | null>>({ p1a: null, p1b: null, p2a: null, p2b: null });
-  const [status, setStatus] = useState('正在加载模拟器...');
+  const [status, setStatus] = useState(() => getLoadingStatus(game.platform));
   const [isFullscreen, setIsFullscreen] = useState(() => Boolean(document.fullscreenElement));
   const [saveSlots, setSaveSlots] = useState<SaveSlot[]>([]);
   const [slotDialogMode, setSlotDialogMode] = useState<'save' | 'load' | null>(null);
+  const [keyBindings, setKeyBindings] = useState<PlayerKeyBindings>(() => loadKeyBindings(game));
+  const [keyBindingDialogOpen, setKeyBindingDialogOpen] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const keymapGroups = createKeymapGroups(keyBindings);
   const [recentSlot, setRecentSlot] = useState<number | null>(null);
 
   function focusEmulatorHost() {
@@ -326,28 +62,13 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
   }
 
   function closeEmulator() {
-    const emulatorWindow = window as EmulatorJsWindow;
-    const emulator = instanceRef.current as ClosableEmulatorJsInstance | null;
-
     stopAllTurbo();
-
-    try {
-      emulator?.pause?.();
-      emulator?.stop?.();
-      emulator?.exit?.();
-      emulator?.destroy?.();
-    } catch {
-      // Ignore cleanup errors while leaving the play page.
-    }
-
-    if (emulatorHostRef.current) {
-      emulatorHostRef.current.innerHTML = '';
-    }
-
+    releaseAllCombos();
+    emulatorParentKeyCaptureCleanupRef.current?.();
+    emulatorParentKeyCaptureCleanupRef.current = null;
+    forceCloseActiveEmulator(emulatorHostRef.current);
     instanceRef.current = null;
-    delete emulatorWindow.EJS_onGameStart;
-    delete emulatorWindow.EJS_onError;
-    delete emulatorWindow.EJS_emulator;
+    setIsPaused(false);
   }
 
   function getTurboTarget(turboKey: TurboKey) {
@@ -357,6 +78,20 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
     };
   }
 
+  function simulateInputSafely(player: number, buttonIndex: number, value: number) {
+    const gameManager = instanceRef.current?.gameManager;
+    if (!gameManager?.simulateInput) {
+      return false;
+    }
+
+    try {
+      gameManager.simulateInput(player, buttonIndex, value);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function stopTurbo(turboKey: TurboKey) {
     const turboInterval = turboIntervalsRef.current[turboKey];
     if (turboInterval !== null) {
@@ -364,13 +99,8 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
       turboIntervalsRef.current[turboKey] = null;
     }
 
-    const emulator = instanceRef.current;
-    if (!emulator) {
-      return;
-    }
-
     const target = getTurboTarget(turboKey);
-    emulator.gameManager.simulateInput(target.player, target.buttonIndex, 0);
+    simulateInputSafely(target.player, target.buttonIndex, 0);
   }
 
   function stopAllTurbo() {
@@ -386,18 +116,121 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
       return;
     }
 
-    const target = getTurboTarget(turboKey);
     let pressed = false;
     turboIntervalsRef.current[turboKey] = window.setInterval(() => {
-      const activeEmulator = instanceRef.current;
-      if (!activeEmulator) {
-        stopTurbo(turboKey);
-        return;
-      }
-
+      const target = getTurboTarget(turboKey);
       pressed = !pressed;
-      activeEmulator.gameManager.simulateInput(target.player, target.buttonIndex, pressed ? 1 : 0);
+      if (!simulateInputSafely(target.player, target.buttonIndex, pressed ? 1 : 0)) {
+        stopTurbo(turboKey);
+      }
     }, TURBO_INTERVAL_MS);
+  }
+
+  function simulateCombo(eventCode: string, value: number) {
+    const comboKey = findComboKey(eventCode, keyBindings);
+    if (!comboKey?.bindingItem.comboButtonIndexes) {
+      return false;
+    }
+
+    if (value === 1 && activeComboKeysRef.current.has(eventCode)) {
+      return true;
+    }
+
+    if (value === 1) {
+      activeComboKeysRef.current.add(eventCode);
+    } else {
+      activeComboKeysRef.current.delete(eventCode);
+    }
+
+    for (const buttonIndex of comboKey.bindingItem.comboButtonIndexes) {
+      simulateInputSafely(comboKey.player, buttonIndex, value);
+    }
+
+    return true;
+  }
+
+  function simulateManualInput(eventCode: string, value: number) {
+    const manualInputKey = findManualInputKey(eventCode, keyBindings);
+    if (!manualInputKey) {
+      return false;
+    }
+
+    return simulateInputSafely(manualInputKey.player, manualInputKey.bindingItem.buttonIndex, value);
+  }
+
+  function simulateTwoPlayerStart(value: number) {
+    return simulateInputSafely(PLAYER_TWO, START_BUTTON_INDEX, value);
+  }
+
+  function simulateOnePlayerStart(value: number) {
+    return simulateInputSafely(PLAYER_ONE, START_BUTTON_INDEX, value);
+  }
+
+  function handleCapturedEmulatorKey(event: KeyboardEvent) {
+    if (event.code === 'Enter') {
+      consumeKeyboardEvent(event);
+      simulateOnePlayerStart(event.type === 'keydown' ? 1 : 0);
+      return true;
+    }
+
+    if (event.code === 'NumpadEnter') {
+      consumeKeyboardEvent(event);
+      return true;
+    }
+
+    if (event.code === 'Numpad0' || event.code === 'NumpadDecimal') {
+      consumeKeyboardEvent(event);
+      simulateTwoPlayerStart(event.type === 'keydown' ? 1 : 0);
+      return true;
+    }
+
+    return false;
+  }
+
+  function attachEmulatorParentKeyCapture(instance: EmulatorJsInstance) {
+    emulatorParentKeyCaptureCleanupRef.current?.();
+    const emulatorParent = instance.elements?.parent;
+    if (!emulatorParent) {
+      return;
+    }
+
+    emulatorParent.addEventListener('keydown', handleCapturedEmulatorKey, true);
+    emulatorParent.addEventListener('keyup', handleCapturedEmulatorKey, true);
+    emulatorParentKeyCaptureCleanupRef.current = () => {
+      emulatorParent.removeEventListener('keydown', handleCapturedEmulatorKey, true);
+      emulatorParent.removeEventListener('keyup', handleCapturedEmulatorKey, true);
+    };
+  }
+
+  function attachRunningEmulator(instance: EmulatorJsInstance, source: string) {
+    const runtimeInstance = instance as EmulatorJsRuntimeInstance;
+    if (runtimeInstance.__gameCatRunningAttached) {
+      instanceRef.current = instance;
+      return;
+    }
+
+    runtimeInstance.__gameCatRunningAttached = true;
+    instanceRef.current = instance;
+    stripReservedHotkeys(instance);
+    stripManualInputKeyCodes(instance, keyBindingsRef.current);
+    stripNativeStartControls(instance);
+    stripNativeKeyboardControls(instance);
+    attachEmulatorParentKeyCapture(instance);
+    window.requestAnimationFrame(() => focusEmulatorHost());
+    setStatus('运行中');
+    console.log('[EmulatorPlayer] running instance attached', {
+      gameId: game.id,
+      title: game.title,
+      source,
+      hasGameManager: Boolean(instance.gameManager),
+      hasCanvas: Boolean(instance.elements?.parent?.querySelector('canvas')),
+    });
+  }
+
+  function releaseAllCombos() {
+    for (const eventCode of activeComboKeysRef.current) {
+      simulateCombo(eventCode, 0);
+    }
   }
 
   function rememberRecentSlot(slot: number) {
@@ -457,6 +290,27 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
   }, [game.id]);
 
   useEffect(() => {
+    const nextBindings = loadKeyBindings(game);
+    keyBindingsRef.current = nextBindings;
+    setKeyBindings(nextBindings);
+  }, [game.id, game.platform]);
+
+  useEffect(() => {
+    keyBindingsRef.current = keyBindings;
+
+    if (instanceRef.current) {
+      stripReservedHotkeys(instanceRef.current);
+      stripManualInputKeyCodes(instanceRef.current, keyBindings);
+      stripNativeStartControls(instanceRef.current);
+      stripNativeKeyboardControls(instanceRef.current);
+    }
+  }, [keyBindings]);
+
+  useEffect(() => {
+    keyBindingDialogOpenRef.current = keyBindingDialogOpen;
+  }, [keyBindingDialogOpen]);
+
+  useEffect(() => {
     const stored = window.localStorage.getItem(getRecentSlotStorageKey(game.id));
     const slot = stored ? Number(stored) : NaN;
     setRecentSlot(Number.isInteger(slot) && slot >= 1 && slot <= 10 ? slot : null);
@@ -482,15 +336,60 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
     }
 
     let disposed = false;
+    let startupWatchInterval: number | null = null;
+    let startupTimeoutId: number | null = null;
     const emulatorWindow = window as EmulatorJsWindow;
     const playerSelector = `#emulator-player-${game.id}`;
     emulatorHost.id = `emulator-player-${game.id}`;
     emulatorHost.tabIndex = 0;
-    emulatorHost.innerHTML = '';
+    forceCloseActiveEmulator(emulatorHost);
     instanceRef.current = null;
 
+    const clearStartupWatchers = () => {
+      if (startupWatchInterval !== null) {
+        window.clearInterval(startupWatchInterval);
+        startupWatchInterval = null;
+      }
+
+      if (startupTimeoutId !== null) {
+        window.clearTimeout(startupTimeoutId);
+        startupTimeoutId = null;
+      }
+    };
+
+    const ensureStartListener = (instance: EmulatorJsInstance, source: string) => {
+      const runtimeInstance = instance as EmulatorJsRuntimeInstance;
+      if (runtimeInstance.__gameCatStartListenerAttached) {
+        return;
+      }
+
+      runtimeInstance.__gameCatStartListenerAttached = true;
+      instance.on?.('start', () => {
+        if (!disposed) {
+          attachRunningEmulator(instance, source);
+        }
+      });
+    };
+
+    const tryAttachAvailableInstance = (source: string) => {
+      const instance = emulatorWindow.EJS_emulator;
+      if (!instance || disposed) {
+        return false;
+      }
+
+      const hasCanvas = Boolean(instance.elements?.parent?.querySelector('canvas') || emulatorHost.querySelector('canvas'));
+      if (!instance.gameManager && !hasCanvas) {
+        return false;
+      }
+
+      attachLifecycleLogs(instance, game);
+      attachRunningEmulator(instance, source);
+      clearStartupWatchers();
+      return true;
+    };
+
     const initialize = async () => {
-      setStatus('正在加载模拟器...');
+      setStatus(getLoadingStatus(game.platform));
       console.log('[EmulatorPlayer] initialize', {
         gameId: game.id,
         title: game.title,
@@ -499,7 +398,7 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
       });
 
       emulatorWindow.EJS_player = playerSelector;
-      emulatorWindow.EJS_core = 'nes';
+      emulatorWindow.EJS_core = getEmulatorSystem(game);
       emulatorWindow.EJS_gameUrl = game.romUrl;
       emulatorWindow.EJS_gameName = `game-${game.id}`;
       emulatorWindow.EJS_pathtodata = '/emulatorjs/data/';
@@ -507,7 +406,8 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
       emulatorWindow.EJS_askBeforeExit = false;
       emulatorWindow.EJS_noAutoFocus = false;
       emulatorWindow.EJS_defaultOptions = {
-        retroarch_core: 'nestopia',
+        retroarch_core: getRetroArchCore(game),
+        ...getCoreOptionSettings(game),
       };
       emulatorWindow.EJS_onGameStart = () => {
         console.log('[EmulatorPlayer] onGameStart', { gameId: game.id, title: game.title });
@@ -515,12 +415,9 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
           return;
         }
 
-        instanceRef.current = emulatorWindow.EJS_emulator ?? null;
-        if (instanceRef.current) {
-          stripReservedHotkeys(instanceRef.current);
+        if (emulatorWindow.EJS_emulator) {
+          attachRunningEmulator(emulatorWindow.EJS_emulator, 'global-callback');
         }
-        window.requestAnimationFrame(() => focusEmulatorHost());
-        setStatus('运行中');
       };
       emulatorWindow.EJS_onError = (message) => {
         console.error('[EmulatorPlayer] onError', { gameId: game.id, title: game.title, message });
@@ -539,23 +436,46 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
 
       if (!emulatorWindow.EJS_emulator) {
         console.log('[EmulatorPlayer] creating emulator instance manually', { gameId: game.id, title: game.title });
-        const instance = new EmulatorConstructor(playerSelector, createEmulatorConfig(game, playerSelector));
+        const instance = new EmulatorConstructor(playerSelector, createEmulatorConfig(game, playerSelector, keyBindingsRef.current));
         attachLifecycleLogs(instance, game);
+        ensureStartListener(instance, 'start-event');
         emulatorWindow.EJS_emulator = instance;
       }
 
       if (!disposed && emulatorWindow.EJS_emulator) {
-        instanceRef.current = emulatorWindow.EJS_emulator;
-        stripReservedHotkeys(emulatorWindow.EJS_emulator);
         attachLifecycleLogs(emulatorWindow.EJS_emulator, game);
+        ensureStartListener(emulatorWindow.EJS_emulator, 'start-event-existing');
         console.log('[EmulatorPlayer] instance attached', { gameId: game.id, title: game.title, hasGameManager: Boolean(emulatorWindow.EJS_emulator.gameManager) });
-        window.requestAnimationFrame(() => focusEmulatorHost());
+        if (emulatorWindow.EJS_emulator.gameManager) {
+          attachRunningEmulator(emulatorWindow.EJS_emulator, 'existing-game-manager');
+        }
       }
 
-      window.setTimeout(() => {
-        if (!disposed && !instanceRef.current) {
-          console.error('[EmulatorPlayer] startup timeout', { gameId: game.id, title: game.title, hasConstructor: Boolean(emulatorWindow.EmulatorJS), hasInstance: Boolean(emulatorWindow.EJS_emulator) });
-          setStatus('模拟器初始化超时，请查看控制台日志');
+      if (!tryAttachAvailableInstance('post-create-check')) {
+        startupWatchInterval = window.setInterval(() => {
+          tryAttachAvailableInstance('poll-ready-instance');
+        }, 250);
+      }
+
+      startupTimeoutId = window.setTimeout(() => {
+        if (tryAttachAvailableInstance('timeout-recovery')) {
+          return;
+        }
+
+        if (!disposed && !instanceRef.current?.gameManager) {
+          console.error('[EmulatorPlayer] startup timeout', {
+            gameId: game.id,
+            title: game.title,
+            hasConstructor: Boolean(emulatorWindow.EmulatorJS),
+            hasInstance: Boolean(emulatorWindow.EJS_emulator),
+            hasGameManager: Boolean(emulatorWindow.EJS_emulator?.gameManager),
+            hasCanvas: Boolean(emulatorHost.querySelector('canvas')),
+          });
+          setStatus(
+            game.platform === 'arcade' || game.platform === 'mame' || game.platform === 'cps1' || game.platform === 'cps2'
+              ? '街机 ROM 仍在解压或启动中，请继续等待几秒后查看控制台日志'
+              : '模拟器启动未完成，请查看控制台日志',
+          );
         }
       }, 8000);
 
@@ -571,103 +491,153 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
     });
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.code === 'KeyU') {
-        event.preventDefault();
-        startTurbo('p1a');
+      if (keyBindingDialogOpenRef.current) {
         return;
       }
 
-      if (event.code === 'KeyI') {
-        event.preventDefault();
-        startTurbo('p1b');
+      if (event.code === 'Enter') {
+        consumeKeyboardEvent(event);
+        simulateOnePlayerStart(1);
         return;
       }
 
-      if (event.code === 'Numpad4') {
-        event.preventDefault();
-        startTurbo('p2a');
+      if (event.code === 'NumpadEnter') {
+        consumeKeyboardEvent(event);
         return;
       }
 
-      if (event.code === 'Numpad5') {
-        event.preventDefault();
-        startTurbo('p2b');
+      if (event.code === 'Numpad0' || event.code === 'NumpadDecimal') {
+        consumeKeyboardEvent(event);
+        simulateTwoPlayerStart(1);
+        return;
+      }
+
+      const turboKey = findTurboKey(event.code, keyBindings);
+      if (turboKey) {
+        consumeKeyboardEvent(event);
+        startTurbo(turboKey);
+        return;
+      }
+
+      if (findComboKey(event.code, keyBindings)) {
+        consumeKeyboardEvent(event);
+        simulateCombo(event.code, 1);
+        return;
+      }
+
+      if (findManualInputKey(event.code, keyBindings)) {
+        consumeKeyboardEvent(event);
+        simulateManualInput(event.code, 1);
         return;
       }
 
       if (event.code === 'F1') {
-        event.preventDefault();
+        consumeKeyboardEvent(event);
         setSlotDialogMode('save');
         return;
       }
 
       if (event.code === 'F2') {
-        event.preventDefault();
+        consumeKeyboardEvent(event);
         setSlotDialogMode('load');
         return;
       }
 
       if (event.code === 'F5') {
-        event.preventDefault();
+        consumeKeyboardEvent(event);
         void handleToggleFullscreen();
         return;
       }
 
       if (event.code === 'F9') {
-        event.preventDefault();
+        consumeKeyboardEvent(event);
         handleRestart();
         return;
       }
 
-      if (event.code === 'Escape' && slotDialogMode) {
-        event.preventDefault();
+      if (event.code === 'Space') {
+        consumeKeyboardEvent(event);
+        handleTogglePause();
+        return;
+      }
+
+      if (event.code === 'Escape') {
+        consumeKeyboardEvent(event);
         setSlotDialogMode(null);
       }
     };
 
     const handleKeyUp = (event: KeyboardEvent) => {
-      if (event.code === 'KeyU') {
-        event.preventDefault();
-        stopTurbo('p1a');
+      if (keyBindingDialogOpenRef.current) {
         return;
       }
 
-      if (event.code === 'KeyI') {
-        event.preventDefault();
-        stopTurbo('p1b');
+      if (event.code === 'Enter') {
+        consumeKeyboardEvent(event);
+        simulateOnePlayerStart(0);
         return;
       }
 
-      if (event.code === 'Numpad4') {
-        event.preventDefault();
-        stopTurbo('p2a');
+      if (event.code === 'NumpadEnter') {
+        consumeKeyboardEvent(event);
         return;
       }
 
-      if (event.code === 'Numpad5') {
-        event.preventDefault();
-        stopTurbo('p2b');
+      if (event.code === 'Numpad0' || event.code === 'NumpadDecimal') {
+        consumeKeyboardEvent(event);
+        simulateTwoPlayerStart(0);
+        return;
+      }
+
+      const turboKey = findTurboKey(event.code, keyBindings);
+      if (turboKey) {
+        consumeKeyboardEvent(event);
+        stopTurbo(turboKey);
+        return;
+      }
+
+      if (findComboKey(event.code, keyBindings)) {
+        consumeKeyboardEvent(event);
+        simulateCombo(event.code, 0);
+        return;
+      }
+
+      if (findManualInputKey(event.code, keyBindings)) {
+        consumeKeyboardEvent(event);
+        simulateManualInput(event.code, 0);
       }
     };
 
     const handleWindowBlur = () => {
       stopAllTurbo();
+      releaseAllCombos();
     };
 
     const handlePointerDown = () => {
       focusEmulatorHost();
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('keydown', handleKeyDown, true);
+    window.addEventListener('keyup', handleKeyUp, true);
+    document.addEventListener('keydown', handleCapturedEmulatorKey, true);
+    document.addEventListener('keyup', handleCapturedEmulatorKey, true);
     window.addEventListener('blur', handleWindowBlur);
+    emulatorHost.addEventListener('keydown', handleCapturedEmulatorKey, true);
+    emulatorHost.addEventListener('keyup', handleCapturedEmulatorKey, true);
     emulatorHost.addEventListener('pointerdown', handlePointerDown);
 
     return () => {
       disposed = true;
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
+      clearStartupWatchers();
+      window.removeEventListener('keydown', handleKeyDown, true);
+      window.removeEventListener('keyup', handleKeyUp, true);
+      document.removeEventListener('keydown', handleCapturedEmulatorKey, true);
+      document.removeEventListener('keyup', handleCapturedEmulatorKey, true);
       window.removeEventListener('blur', handleWindowBlur);
+      emulatorParentKeyCaptureCleanupRef.current?.();
+      emulatorParentKeyCaptureCleanupRef.current = null;
+      emulatorHost.removeEventListener('keydown', handleCapturedEmulatorKey, true);
+      emulatorHost.removeEventListener('keyup', handleCapturedEmulatorKey, true);
       emulatorHost.removeEventListener('pointerdown', handlePointerDown);
       closeEmulator();
     };
@@ -683,6 +653,45 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
         // Continue navigation even if fullscreen exit is denied.
       }
     }
+  }
+
+  function updateKeyBinding(player: 0 | 1, label: string, event: ReactKeyboardEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (event.code === 'Escape') {
+      return;
+    }
+
+    if (player === PLAYER_TWO && label === 'Start' && event.code === 'NumpadEnter') {
+      setStatus('2P Start 请使用小键盘 0 或小键盘 .');
+      return;
+    }
+
+    const keyLabel = event.key === ' ' ? 'Space' : event.key;
+    const nextBindings: PlayerKeyBindings = {
+      0: keyBindings[0].map((bindingItem) =>
+        player === 0 && bindingItem.label === label
+          ? { ...bindingItem, eventCode: event.code, keyCode: event.keyCode, keyLabel }
+          : bindingItem,
+      ),
+      1: keyBindings[1].map((bindingItem) =>
+        player === 1 && bindingItem.label === label
+          ? { ...bindingItem, eventCode: event.code, keyCode: event.keyCode, keyLabel }
+          : bindingItem,
+      ),
+    };
+
+    saveKeyBindings(game.id, nextBindings);
+    setKeyBindings(nextBindings);
+    setStatus('键位配置已保存，本地立即生效');
+  }
+
+  function resetKeyBindings() {
+    const defaults = getDefaultKeyBindings(game.platform);
+    clearKeyBindings(game.id);
+    setKeyBindings(defaults);
+    setStatus('键位配置已恢复默认');
   }
 
   async function handleSave(slot = 1) {
@@ -735,7 +744,30 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
     }
 
     emulator.gameManager.restart();
+    emulator.play?.();
+    setIsPaused(false);
     setStatus('游戏已重开');
+  }
+
+  function handleTogglePause() {
+    const emulator = instanceRef.current;
+    if (!emulator) {
+      setStatus('模拟器尚未准备完成');
+      return;
+    }
+
+    if (isPaused || emulator.paused) {
+      emulator.play?.();
+      setIsPaused(false);
+      setStatus('游戏已继续');
+      return;
+    }
+
+    stopAllTurbo();
+    releaseAllCombos();
+    emulator.pause?.();
+    setIsPaused(true);
+    setStatus('游戏已暂停');
   }
 
   async function handleToggleFullscreen() {
@@ -758,6 +790,10 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
     }
   }
 
+  function scrollToControlsGuide() {
+    document.getElementById('player-controls-guide')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
   return (
     <>
       {!isFullscreen ? (
@@ -772,51 +808,32 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
         <div className="player-stage">
           <div ref={emulatorHostRef} className="emulator-host" />
           <p className="muted player-status">状态: {status}</p>
+          <section className="detail-description-card player-controls-card" id="player-controls-guide">
+            <p className="eyebrow detail-controls-eyebrow">操作说明</p>
+            <p className="muted detail-description-text">{game.controlsHelp || '当前游戏暂未填写单独的操作说明，下面的默认键位可直接作为开玩参考。'}</p>
+          </section>
         </div>
         <aside className="player-sidebar">
           <p className="eyebrow">游玩页</p>
           <h1>{game.title}</h1>
           <p className="muted">{game.description || '当前游戏暂无简介。'}</p>
           <p className="muted">平台: {getPlatformLabel(game.platform)}</p>
-          {game.platform === 'arcade' ? (
-            <ul className="keymap">
-              <li>1P WASD: 移动</li>
-              <li>1P J/K/L/O/P: 按键 A/B/C/D/E</li>
-              <li>1P U/I: Turbo A/B</li>
-              <li>2P 方向键: 移动</li>
-              <li>2P 小键盘 1/2/3/6/7: 按键 A/B/C/D/E</li>
-              <li>2P 小键盘 4/5: Turbo A/B</li>
-              <li>2P 小键盘 Enter: Start</li>
-              <li>2P 小键盘 0: Select/Coin</li>
-              <li>Enter: 1P Start</li>
-              <li>Shift: 1P Select/Coin</li>
-            </ul>
-          ) : game.platform === 'snes' || game.platform === 'segaMD' ? (
-            <ul className="keymap">
-              <li>1P WASD: 移动</li>
-              <li>1P J/K/L/O/P: 主按键</li>
-              <li>1P Enter: Start</li>
-              <li>1P Shift: Select/Mode</li>
-              <li>2P 方向键: 移动</li>
-              <li>2P 小键盘 1/2/3/6/7: 主按键</li>
-              <li>2P 小键盘 Enter: Start</li>
-              <li>2P 小键盘 0: Select/Mode</li>
-            </ul>
-          ) : (
-            <ul className="keymap">
-              <li>1P WASD: 移动</li>
-              <li>1P J/K: A/B</li>
-              <li>1P U/I: Turbo A/B</li>
-              <li>2P 方向键: 移动</li>
-              <li>2P 小键盘 1/2: A/B</li>
-              <li>2P 小键盘 4/5: Turbo A/B</li>
-              <li>2P 小键盘 Enter: Start</li>
-              <li>2P 小键盘 0: Select</li>
-              <li>Enter: Start</li>
-              <li>Shift: Select</li>
-            </ul>
-          )}
+          <div className="keymap-panels">
+            {keymapGroups.map((group) => (
+              <section className="keymap-panel" key={group.title}>
+                <h2>{group.title}</h2>
+                <ul className="keymap">
+                  {group.items.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </section>
+            ))}
+          </div>
           <div className={`card-actions player-actions ${isFullscreen ? 'is-fullscreen' : ''}`}>
+            <button type="button" onClick={scrollToControlsGuide}>
+              查看操作说明
+            </button>
             <button type="button" onClick={() => setSlotDialogMode('save')}>
               保存进度 F1
             </button>
@@ -826,12 +843,61 @@ export function EmulatorPlayer({ game }: EmulatorPlayerProps) {
             <button type="button" onClick={handleRestart}>
               重开游戏 F9
             </button>
+            <button type="button" onClick={handleTogglePause}>
+              {isPaused ? '继续游戏 Space' : '暂停游戏 Space'}
+            </button>
             <button type="button" onClick={() => void handleToggleFullscreen()}>
               {isFullscreen ? '退出全屏 F5' : '全屏游戏 F5'}
+            </button>
+            <button type="button" onClick={() => setKeyBindingDialogOpen(true)}>
+              配置键位
             </button>
           </div>
         </aside>
       </section>
+
+      {keyBindingDialogOpen ? (
+        <div className="save-dialog-backdrop" onClick={() => setKeyBindingDialogOpen(false)}>
+          <section className="save-dialog key-binding-dialog" onClick={(event) => event.stopPropagation()}>
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">本地配置</p>
+                <h2>配置当前游戏键位</h2>
+              </div>
+              <button type="button" onClick={() => setKeyBindingDialogOpen(false)}>
+                关闭
+              </button>
+            </div>
+            <p className="muted">每个游戏独立保存一套键位。点击动作行后按下新的键，列表左侧是游戏动作，右侧是当前键盘按键。</p>
+            <div className="key-binding-grid">
+              {([0, 1] as const).map((player) => (
+                <section className="key-binding-panel" key={player}>
+                  <h3>{player + 1}P 操作</h3>
+                  {keyBindings[player].map((bindingItem) => (
+                    <button
+                      className="key-binding-row"
+                      key={bindingItem.label}
+                      type="button"
+                      onKeyDown={(event) => updateKeyBinding(player, bindingItem.label, event)}
+                    >
+                      <span>{bindingItem.label}</span>
+                      <strong>{bindingItem.keyLabel}</strong>
+                    </button>
+                  ))}
+                </section>
+              ))}
+            </div>
+            <div className="card-actions key-binding-actions">
+              <button type="button" onClick={resetKeyBindings}>
+                恢复默认键位
+              </button>
+              <button type="button" onClick={() => setKeyBindingDialogOpen(false)}>
+                完成
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
 
       {slotDialogMode ? (
         <div className="save-dialog-backdrop" onClick={() => setSlotDialogMode(null)}>
